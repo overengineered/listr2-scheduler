@@ -1,97 +1,111 @@
-import { gray, dim, strikethrough } from "colorette";
+import { gray, dim } from "colorette";
 import {
   Listr,
-  ListrRendererFactory as _LRF,
-  ListrTaskWrapper,
-  ListrTask,
   ListrLogger,
   ListrLogLevels,
+  ListrTask,
   LoggerFieldOptions,
+  ProcessOutput,
 } from "listr2";
 
-type Executor = ListrTaskWrapper<unknown, _LRF, _LRF>;
-
 type Output<T> = { key: T };
-type ConfigShape = Record<string, unknown>;
 
 type Actions = {
   call: ((task: () => Promise<unknown>) => void) &
     ((label: string, task: () => Promise<unknown>) => void);
 };
 
-type Pattern<K extends string> = K | `?${K}` | `!${K}`;
+type Pattern<T extends string> = T | `?${T}` | `!${T}`;
 
-type Matcher<T extends ConfigShape, K extends keyof T & string> = ((
-  condition: Pattern<K> | Pattern<K>[] | null
+type Matcher<T extends string> = ((
+  condition: Pattern<T> | Pattern<T>[] | null
 ) => Actions) &
-  (<R extends K>(condition: K | K[] | null, output: Output<R>) => Actions);
+  (<R extends T>(
+    condition: Pattern<T> | Pattern<T>[] | null,
+    output: Output<R>
+  ) => Actions);
 
-type DefineFn<T extends ConfigShape, K extends keyof T & string> = (
-  when: Matcher<T, K>,
-  make: <R extends K>(key: R) => Output<R>
+type DefineFn<T extends string> = (
+  when: Matcher<T>,
+  make: <R extends T>(key: R) => Output<R>
 ) => void;
 
 type Step = {
   title: string;
-  filters: Pattern<string>[];
+  isQualified: (config: Record<string, unknown>) => boolean;
   input: string[];
   output?: Output<string>;
-  run: (options: { data: Record<string, unknown> }) => unknown;
+  run: (worker: { data: Record<string, unknown> }) => unknown;
 };
 
-export type Driver<T extends object> = {
+export type Driver<T extends string> = {
   run: (
     options: {
       printer: "verbose" | "vivid";
       dryRun?: boolean | number;
     },
-    config?: Partial<T>
+    config?: Partial<Record<T, unknown>>
   ) => Promise<void>;
 };
 
-export function schedule<T extends ConfigShape, K extends keyof T & string>(
-  define: DefineFn<T, K>
-): Driver<T> {
+export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
   const steps: Step[] = [];
-  const when: Matcher<T, K> = (
-    condition: Pattern<K> | Pattern<K>[] | null,
-    output?: Output<K>
+  const when: Matcher<T> = (
+    condition: Pattern<T> | Pattern<T>[] | null,
+    output?: Output<T>
   ) => ({
     call: (nameSource: (() => unknown) | string, fn?: () => unknown) => {
       const run = typeof nameSource === "function" ? nameSource : nonNull(fn);
       const title = typeof nameSource === "string" ? nameSource : getTitle(run);
       const input: string[] = [];
-      const filters: Pattern<string>[] = [];
+      const requirements: { key: string; expect: boolean }[] = [];
       asList(condition).forEach((pattern) => {
         if (pattern.startsWith("!") || pattern.startsWith("?")) {
-          input.push(pattern.slice(1));
-          filters.push(pattern);
+          const key = pattern.slice(1);
+          input.push(key);
+          requirements.push({ key, expect: pattern.startsWith("?") });
         } else {
           input.push(pattern);
         }
       });
-      steps.push({ title, filters, input, output, run });
+      const isQualified = (state: Record<string, unknown>) =>
+        requirements.every(
+          (condition) =>
+            state[condition.key] === undefined ||
+            !!state[condition.key] === condition.expect
+        );
+      steps.push({ title, isQualified, input, output, run });
     },
   });
-  const make: <R extends K>(key: R) => Output<R> = (key) => ({ key });
+  const make: <R extends T>(key: R) => Output<R> = (key) => ({ key });
 
   define(when, make);
 
   return {
     run: async (options, config) => {
-      const inputs = new Set(steps.flatMap((step) => step.input));
+      const runnable = steps.filter((it) => it.isQualified(config));
+      const inputs = new Set(runnable.flatMap((step) => step.input));
       const done = new Set(
         [...inputs].filter((key) => config && config[key] !== undefined)
       );
       const isReady = (step: Step) => step.input.every((key) => done.has(key));
       for (const key of inputs) {
-        validate(steps, key, [], isReady);
+        validate(runnable, key, [], done, isReady);
       }
 
       const data = { ...config };
-      const eventLogger = new AlignedLogger();
-      const remaining = new Set(steps);
-      const ready = steps.filter(isReady);
+      const eventLogger = new CustomLogger();
+
+      if (options.printer === "verbose" && runnable.length < steps.length) {
+        for (const skipped of steps) {
+          if (!runnable.includes(skipped)) {
+            eventLogger.log(ListrLogLevels.SKIPPED, `${skipped.title}`);
+          }
+        }
+      }
+
+      const remaining = new Set(runnable);
+      const ready = runnable.filter(isReady);
       ready.forEach((step) => remaining.delete(step));
       const logger = options.printer === "verbose" ? eventLogger : undefined;
       const tasks = ready.map((step) =>
@@ -104,6 +118,7 @@ export function schedule<T extends ConfigShape, K extends keyof T & string>(
         ...(options.printer === "vivid"
           ? {
               renderer: "default",
+              collapseSkips: false,
               rendererOptions: {
                 collapseSubtasks: false,
               },
@@ -130,13 +145,24 @@ function createTask(
 ): ListrTask {
   return {
     title: step.title,
+    skip: () => !step.isQualified(data),
     task: async (_, executor) => {
-      const details = { title: step.title, executor, isFinished: false };
+      const state = {
+        start: Date.now(),
+        title: step.title,
+        isFinished: false,
+        update: () => {
+          const passed = formatDuration(Date.now() - state.start);
+          executor.title = state.title + " " + dim(gray(passed));
+        },
+      };
+      undoTitleRewriteOnError(executor);
       const result = await Promise.race([
         step.run({ data }),
-        updateTiming(details),
+        periodicUpdate(state),
       ]);
-      details.isFinished = true;
+      state.isFinished = true;
+      state.update();
       if (step.output) {
         data[step.output.key] = result;
         done.add(step.output.key);
@@ -149,8 +175,7 @@ function createTask(
         }
         if (ready.length > 0) {
           if (logger) {
-            logger.log(ListrLogLevels.TITLE, executor.title);
-            executor.title = step.title;
+            logger.log(ListrLogLevels.COMPLETED, executor.title);
           }
           return executor.newListr(
             ready.map((next) => createTask(next, done, waiting, data, logger))
@@ -165,10 +190,11 @@ function validate(
   steps: Step[],
   key: string,
   visited: Step[],
+  done: Set<string>,
   isRoot: (step: Step) => boolean
 ): void {
   const preceding = steps.filter((t) => t.output?.key === key);
-  if (preceding.length === 0) {
+  if (preceding.length === 0 && !done.has(key)) {
     throw new Error(`Cannot reach "${key}"`);
   }
   const remaining = preceding.filter((t) => !isRoot(t));
@@ -179,35 +205,45 @@ function validate(
     }
     const optionPath = visited.concat(option);
     for (const target of option.input) {
-      validate(steps, target, optionPath, isRoot);
+      validate(steps, target, optionPath, done, isRoot);
     }
   }
 }
 
-function updateTiming(details: {
-  title: string;
-  executor: Executor;
-  isFinished: boolean;
-}) {
-  const start = Date.now();
+function periodicUpdate(state: { isFinished: boolean; update: () => void }) {
   let end = (value?: never): unknown => void value;
   const promise = new Promise<undefined>((res) => (end = res));
   const periodicTicker = setInterval(() => {
-    if (details.isFinished) {
+    if (state.isFinished) {
       end();
       clearInterval(periodicTicker);
     } else {
-      const passed = formatDuration(Date.now() - start);
-      details.executor.title = details.title + " " + dim(gray(passed));
+      state.update();
     }
   }, 125);
   return promise;
 }
 
-class AlignedLogger extends ListrLogger {
+class CustomOutput extends ProcessOutput {
+  toStdout(buffer: string, eol?: boolean): boolean {
+    if (buffer) {
+      return super.toStdout(buffer, eol);
+    }
+  }
+  toStderr(buffer: string, eol?: boolean): boolean {
+    if (buffer) {
+      return super.toStdout(buffer, eol);
+    }
+  }
+}
+
+class CustomLogger extends ListrLogger {
+  skippable = new Set();
+
   constructor() {
     super({
       useIcons: false,
+      processOutput: new CustomOutput(),
       fields: {
         prefix: [
           {
@@ -225,15 +261,32 @@ class AlignedLogger extends ListrLogger {
     message: string | any[],
     options?: LoggerFieldOptions<false> | undefined
   ): string {
-    const tag =
-      level === ListrLogLevels.STARTED
-        ? "-->"
-        : level === ListrLogLevels.TITLE
-        ? "..."
-        : level === ListrLogLevels.COMPLETED
-        ? "=*="
-        : level;
-    return super.format("", `[${tag}] ${message}`, options);
+    if (level !== ListrLogLevels.COMPLETED || !this.skippable.has(message)) {
+      level === ListrLogLevels.COMPLETED && this.skippable.add(message);
+      const tag =
+        level === ListrLogLevels.STARTED
+          ? "-->"
+          : level === ListrLogLevels.COMPLETED
+          ? "=*="
+          : level;
+      return super.format("", `[${tag}] ${message}`, options);
+    } else {
+      return "";
+    }
+  }
+}
+
+function undoTitleRewriteOnError(wrapper: any) {
+  if (!wrapper.__LS__report) {
+    wrapper.__LS__report = wrapper.report;
+    wrapper.report = customReport.bind(wrapper);
+  }
+}
+
+function customReport(error: unknown, type: unknown) {
+  this.__LS__report?.(error, type);
+  if (this.task?.title) {
+    this.task.message$ = { error: this.task.title };
   }
 }
 
