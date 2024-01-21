@@ -11,8 +11,8 @@ import {
 type Output<T> = { key: T };
 
 type Actions = {
-  call: ((task: () => Promise<unknown>) => void) &
-    ((label: string, task: () => Promise<unknown>) => void);
+  call: ((task: (worker: Worker) => Promise<unknown>) => void) &
+    ((label: string, task: (worker: Worker) => Promise<unknown>) => void);
 };
 
 type Pattern<T extends string> = T | `?${T}` | `!${T}`;
@@ -30,12 +30,18 @@ type DefineFn<T extends string> = (
   make: <R extends T>(key: R) => Output<R>
 ) => void;
 
+export interface Worker {
+  data: Record<string, unknown>;
+  reportStatus(text: string): void;
+  updateTitle(title: string): void;
+}
+
 type Step = {
   title: string;
   isQualified: (config: Record<string, unknown>) => boolean;
   input: string[];
   output?: Output<string>;
-  run: (worker: { data: Record<string, unknown> }) => unknown;
+  run: (worker: Worker) => unknown;
 };
 
 export type Driver<T extends string> = {
@@ -54,7 +60,10 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
     condition: Pattern<T> | Pattern<T>[] | null,
     output?: Output<T>
   ) => ({
-    call: (nameSource: (() => unknown) | string, fn?: () => unknown) => {
+    call: (
+      nameSource: ((worker: Worker) => unknown) | string,
+      fn?: (worker: Worker) => unknown
+    ) => {
       const run = typeof nameSource === "function" ? nameSource : nonNull(fn);
       const title = typeof nameSource === "string" ? nameSource : getTitle(run);
       const input: string[] = [];
@@ -121,6 +130,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
               collapseSkips: false,
               rendererOptions: {
                 collapseSubtasks: false,
+                formatOutput: "truncate",
               },
             }
           : {
@@ -158,9 +168,16 @@ function createTask(
         },
       };
       undoTitleRewriteOnError(executor);
-      const job = dryRun ? Promise.resolve() : step.run({ data });
+      const worker: Worker = {
+        data,
+        reportStatus: (text) => !state.isFinished && (executor.output = text),
+        updateTitle: (title) => !state.isFinished && (state.title = title),
+      };
+      const job = dryRun ? Promise.resolve() : step.run(worker);
       const result = await Promise.race([job, periodicUpdate(state)]);
       state.isFinished = true;
+      state.title = step.title;
+      !logger && (executor.output = "");
       state.update();
       if (step.output) {
         data[step.output.key] = result;
@@ -196,13 +213,15 @@ function validate(
 ): void {
   const preceding = steps.filter((t) => t.output?.key === key);
   if (preceding.length === 0 && !done.has(key)) {
-    throw new Error(`Cannot reach "${key}"`);
+    const origin = steps.find((step) => step.input.includes(key));
+    const info = origin ? ` required for ${origin.title}` : "";
+    throw new Error(`Cannot find how to make "${key}"${info}`);
   }
   const remaining = preceding.filter((t) => !isRoot(t));
   for (const option of remaining) {
     if (visited.includes(option)) {
       const cycle = [...visited, option].map((it) => it.title).join("->");
-      throw new Error(`Unreachable cycle found "${cycle}"`);
+      throw new Error(`Unsupported cycle found "${cycle}"`);
     }
     const optionPath = visited.concat(option);
     for (const target of option.input) {
@@ -323,7 +342,7 @@ function asList<T>(container: T | T[] | null): T[] {
     : [container];
 }
 
-function getTitle(fn: () => unknown) {
+function getTitle(fn: Function) {
   if (!fn.name) {
     throw new Error(`Missing name for function **${fn}**`);
   }
