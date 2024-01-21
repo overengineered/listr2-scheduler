@@ -42,7 +42,7 @@ export type Driver<T extends string> = {
   run: (
     options: {
       printer: "verbose" | "vivid";
-      dryRun?: boolean | number;
+      dryRun?: boolean;
     },
     config?: Partial<Record<T, unknown>>
   ) => Promise<void>;
@@ -109,7 +109,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
       ready.forEach((step) => remaining.delete(step));
       const logger = options.printer === "verbose" ? eventLogger : undefined;
       const tasks = ready.map((step) =>
-        createTask(step, done, remaining, data, logger)
+        createTask(step, done, remaining, data, options.dryRun, logger)
       );
 
       const start = Date.now();
@@ -141,6 +141,7 @@ function createTask(
   done: Set<string>,
   waiting: Set<Step>,
   data: Record<string, unknown>,
+  dryRun: boolean,
   logger?: ListrLogger
 ): ListrTask {
   return {
@@ -157,10 +158,8 @@ function createTask(
         },
       };
       undoTitleRewriteOnError(executor);
-      const result = await Promise.race([
-        step.run({ data }),
-        periodicUpdate(state),
-      ]);
+      const job = dryRun ? Promise.resolve() : step.run({ data });
+      const result = await Promise.race([job, periodicUpdate(state)]);
       state.isFinished = true;
       state.update();
       if (step.output) {
@@ -178,7 +177,9 @@ function createTask(
             logger.log(ListrLogLevels.COMPLETED, executor.title);
           }
           return executor.newListr(
-            ready.map((next) => createTask(next, done, waiting, data, logger))
+            ready.map((next) =>
+              createTask(next, done, waiting, data, dryRun, logger)
+            )
           );
         }
       }
