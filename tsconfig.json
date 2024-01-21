@@ -1,8 +1,9 @@
 {
   "compilerOptions": {
     "noEmit": false,
-    "target": "es6",
-    "module": "CommonJS",
+    "lib": ["ES2021"],
+    "target": "ES2021",
+    "module": "Node16",
     "declaration": true,
     "rootDir": "src",
     "outDir": "./dist",

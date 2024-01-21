@@ -1,4 +1,6 @@
-import { gray, dim } from "colorette";
+import { Readable, Transform } from "node:stream";
+import { EOL } from "node:os";
+import { gray, dim, yellow } from "colorette";
 import {
   Listr,
   ListrLogger,
@@ -34,9 +36,15 @@ export interface Worker {
   data: Record<string, unknown>;
   reportStatus(text: string): void;
   updateTitle(title: string): void;
+  pipeTagged(
+    source: Readable,
+    destination: NodeJS.WritableStream,
+    options?: { timestamp?: boolean }
+  );
 }
 
 type Step = {
+  id: string;
   title: string;
   isQualified: (config: Record<string, unknown>) => boolean;
   input: string[];
@@ -64,6 +72,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
       nameSource: ((worker: Worker) => unknown) | string,
       fn?: (worker: Worker) => unknown
     ) => {
+      const id = `@${String(steps.length + 1).padStart(2, "0")}`;
       const run = typeof nameSource === "function" ? nameSource : nonNull(fn);
       const title = typeof nameSource === "string" ? nameSource : getTitle(run);
       const input: string[] = [];
@@ -83,7 +92,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
             state[condition.key] === undefined ||
             !!state[condition.key] === condition.expect
         );
-      steps.push({ title, isQualified, input, output, run });
+      steps.push({ id, title, isQualified, input, output, run });
     },
   });
   const make: <R extends T>(key: R) => Output<R> = (key) => ({ key });
@@ -155,7 +164,7 @@ function createTask(
   logger?: ListrLogger
 ): ListrTask {
   return {
-    title: step.title,
+    title: step.title + " " + yellow(step.id),
     skip: () => !step.isQualified(data),
     task: async (_, executor) => {
       const state = {
@@ -172,6 +181,11 @@ function createTask(
         data,
         reportStatus: (text) => !state.isFinished && (executor.output = text),
         updateTitle: (title) => !state.isFinished && (state.title = title),
+        pipeTagged(source, destination, { timestamp } = { timestamp: true }) {
+          source
+            .pipe(addLinePrefix({ timestamp, tag: step.id }))
+            .pipe(destination, { end: false });
+        },
       };
       const job = dryRun ? Promise.resolve() : step.run(worker);
       const result = await Promise.race([job, periodicUpdate(state)]);
@@ -315,16 +329,71 @@ function formatDuration(millis: number) {
 }
 
 function getFormattedTimestamp() {
-  const now = new Date();
+  return formatTimestamp(new Date());
+}
+
+function formatTimestamp(time: Date) {
   return (
-    String(now.getHours()).padStart(2, "0") +
+    String(time.getHours()).padStart(2, "0") +
     ":" +
-    String(now.getMinutes()).padStart(2, "0") +
+    String(time.getMinutes()).padStart(2, "0") +
     ":" +
-    String(now.getSeconds()).padStart(2, "0") +
+    String(time.getSeconds()).padStart(2, "0") +
     "." +
-    String(now.getMilliseconds()).padStart(3, "0")
+    String(time.getMilliseconds()).padStart(3, "0")
   );
+}
+
+function addLinePrefix(options: {
+  timestamp: boolean;
+  tag?: string;
+}): Transform {
+  let fragment = "";
+  let fragmentStart = new Date();
+  return new Transform({
+    transform(chunk, encoding, callback) {
+      const now = new Date();
+
+      const buffer = fragment + chunk + "*";
+      const lines = buffer.split(/\r?\n/);
+      if (lines.length === 1) {
+        fragmentStart = fragment ? fragmentStart : now;
+        fragment = buffer.slice(0, -1);
+        callback(null, "");
+        return;
+      }
+
+      const diff = fragment ? now.getTime() - fragmentStart.getTime() : 0;
+      const tag = options.tag ? options.tag + " " : "";
+      const prefix = `[${formatTimestamp(now)}] ${yellow(tag)}`;
+
+      const timeInfo = formatTimestamp(fragmentStart);
+      const age =
+        diff > 999000
+          ? (diff / 1000 / 60).toFixed(1).padStart(6, "0")
+          : (diff / 1000).toFixed(0).padStart(3, "0");
+      const displayTimeInfo =
+        diff < 1000 ? timeInfo : timeInfo.slice(0, -age.length - 1) + "+" + age;
+
+      const fragmentPrefix = fragment
+        ? `[${displayTimeInfo}] ${yellow(tag)}`
+        : prefix;
+
+      const lastLine = lines.at(-1);
+      if (lastLine === "*") {
+        fragment = "";
+      } else {
+        fragment = lastLine?.slice(0, -1) ?? "";
+        fragmentStart = now;
+      }
+      lines.splice(lines.length - 1, 1);
+      const output = lines.join(EOL + prefix);
+      callback(null, fragmentPrefix + output + EOL);
+    },
+    flush(callback) {
+      callback(null, fragment);
+    },
+  });
 }
 
 function nonNull<T>(value: T | null | undefined): T {
