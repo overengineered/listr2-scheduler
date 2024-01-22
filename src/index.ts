@@ -101,7 +101,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
 
   return {
     run: async (options, config) => {
-      const runnable = steps.filter((it) => it.isQualified(config));
+      const runnable = steps.filter((it) => it.isQualified(config ?? {}));
       const inputs = new Set(runnable.flatMap((step) => step.input));
       const done = new Set(
         [...inputs].filter((key) => config && config[key] !== undefined)
@@ -127,7 +127,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
       ready.forEach((step) => remaining.delete(step));
       const logger = options.printer === "verbose" ? eventLogger : undefined;
       const tasks = ready.map((step) =>
-        createTask(step, done, remaining, data, options.dryRun, logger)
+        createTask(step, done, remaining, data, !!options.dryRun, logger)
       );
 
       const start = Date.now();
@@ -181,7 +181,7 @@ function createTask(
         data,
         reportStatus: (text) => !state.isFinished && (executor.output = text),
         updateTitle: (title) => !state.isFinished && (state.title = title),
-        pipeTagged(source, destination, { timestamp } = { timestamp: true }) {
+        pipeTagged(source, destination, { timestamp = true } = {}) {
           source
             .pipe(addLinePrefix({ timestamp, tag: step.id }))
             .pipe(destination, { end: false });
@@ -263,11 +263,13 @@ class CustomOutput extends ProcessOutput {
     if (buffer) {
       return super.toStdout(buffer, eol);
     }
+    return false;
   }
   toStderr(buffer: string, eol?: boolean): boolean {
     if (buffer) {
       return super.toStdout(buffer, eol);
     }
+    return false;
   }
 }
 
