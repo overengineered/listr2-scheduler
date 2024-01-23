@@ -10,38 +10,55 @@ import {
   ProcessOutput,
 } from "listr2";
 
-type Output<T> = { key: T };
+export interface Toolkit {}
 
-type Actions = {
-  call: ((task: (worker: Worker) => Promise<unknown>) => void) &
-    ((label: string, task: (worker: Worker) => Promise<unknown>) => void);
-};
-
-type Pattern<T extends string> = T | `?${T}` | `!${T}`;
-
-type Matcher<T extends string> = ((
-  condition: Pattern<T> | Pattern<T>[] | null
-) => Actions) &
-  (<R extends T>(
-    condition: Pattern<T> | Pattern<T>[] | null,
-    output: Output<R>
-  ) => Actions);
-
-type DefineFn<T extends string> = (
-  when: Matcher<T>,
-  make: <R extends T>(key: R) => Output<R>
-) => void;
-
-export interface Worker {
+export type Worker = {
   data: Record<string, unknown>;
   reportStatus(text: string): void;
   updateTitle(title: string): void;
   pipeTagged(
     source: Readable,
     destination: NodeJS.WritableStream,
-    options?: { timestamp?: boolean }
+    options?: { timestamp?: boolean; letter?: Letter }
   );
-}
+  toolkit: Toolkit;
+};
+
+export type Driver<Keys extends string> = {
+  run: (
+    options: {
+      printer: "verbose" | "vivid";
+      dryRun?: boolean;
+    } & (keyof Toolkit extends never
+      ? { toolkit?: Toolkit }
+      : { toolkit: Toolkit }),
+    config?: Partial<Record<Keys, unknown>>
+  ) => Promise<void>;
+};
+
+type Configurator<Keys extends string> = (
+  when: Matcher<Keys>,
+  make: (key: Keys) => Output<Keys>
+) => void;
+
+type Matcher<Keys extends string> = ((
+  condition: Pattern<Keys> | Pattern<Keys>[] | null
+) => Actions) &
+  ((
+    condition: Pattern<Keys> | Pattern<Keys>[] | null,
+    output: Output<Keys>
+  ) => Actions);
+
+type Actions = {
+  call: ((task: (worker: Worker) => Promise<unknown>) => void) &
+    ((label: string, task: (worker: Worker) => Promise<unknown>) => void);
+};
+
+type Pattern<Keys extends string> = Keys | `?${Keys}` | `!${Keys}`;
+type Output<Keys> = { key: Keys };
+type _L1 = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J";
+type _L2 = "K" | "L" | "M" | "N" | "O" | "P" | "Q" | "R" | "S" | "T";
+type Letter = _L1 | _L2 | "U" | "V" | "W" | "X" | "Y" | "Z";
 
 type Step = {
   id: string;
@@ -52,21 +69,22 @@ type Step = {
   run: (worker: Worker) => unknown;
 };
 
-export type Driver<T extends string> = {
-  run: (
-    options: {
-      printer: "verbose" | "vivid";
-      dryRun?: boolean;
-    },
-    config?: Partial<Record<T, unknown>>
-  ) => Promise<void>;
+type Runtime = {
+  done: Set<string>;
+  waiting: Set<Step>;
+  data: Record<string, unknown>;
+  dryRun: boolean;
+  logger?: ListrLogger;
+  toolkit: Toolkit;
 };
 
-export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
+export function schedule<Keys extends string = string>(
+  define: Configurator<Keys>
+): Driver<Keys> {
   const steps: Step[] = [];
-  const when: Matcher<T> = (
-    condition: Pattern<T> | Pattern<T>[] | null,
-    output?: Output<T>
+  const when: Matcher<Keys> = (
+    condition: Pattern<Keys> | Pattern<Keys>[] | null,
+    output?: Output<Keys>
   ) => ({
     call: (
       nameSource: ((worker: Worker) => unknown) | string,
@@ -95,7 +113,7 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
       steps.push({ id, title, isQualified, input, output, run });
     },
   });
-  const make: <R extends T>(key: R) => Output<R> = (key) => ({ key });
+  const make: (key: Keys) => Output<Keys> = (key) => ({ key });
 
   define(when, make);
 
@@ -111,13 +129,12 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
         validate(runnable, key, [], done, isReady);
       }
 
-      const data = { ...config };
-      const eventLogger = new CustomLogger();
+      const logger = new CustomLogger();
 
       if (options.printer === "verbose" && runnable.length < steps.length) {
         for (const skipped of steps) {
           if (!runnable.includes(skipped)) {
-            eventLogger.log(ListrLogLevels.SKIPPED, `${skipped.title}`);
+            logger.log(ListrLogLevels.SKIPPED, `${skipped.title}`);
           }
         }
       }
@@ -125,10 +142,15 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
       const remaining = new Set(runnable);
       const ready = runnable.filter(isReady);
       ready.forEach((step) => remaining.delete(step));
-      const logger = options.printer === "verbose" ? eventLogger : undefined;
-      const tasks = ready.map((step) =>
-        createTask(step, done, remaining, data, !!options.dryRun, logger)
-      );
+      const runtime: Runtime = {
+        data: { ...config },
+        done,
+        waiting: remaining,
+        dryRun: !!options.dryRun,
+        logger: options.printer === "verbose" ? logger : undefined,
+        toolkit: options.toolkit ?? {},
+      };
+      const tasks = ready.map((step) => createTask(step, runtime));
 
       const start = Date.now();
       await new Listr(tasks, {
@@ -150,19 +172,13 @@ export function schedule<T extends string>(define: DefineFn<T>): Driver<T> {
             }),
       }).run();
 
-      eventLogger.log("FINISHED", formatDuration(Date.now() - start));
+      logger.log("FINISHED", formatDuration(Date.now() - start));
     },
   };
 }
 
-function createTask(
-  step: Step,
-  done: Set<string>,
-  waiting: Set<Step>,
-  data: Record<string, unknown>,
-  dryRun: boolean,
-  logger?: ListrLogger
-): ListrTask {
+function createTask(step: Step, runtime: Runtime): ListrTask {
+  const { data, done, waiting, logger } = runtime;
   return {
     title: step.title + " " + yellow(step.id),
     skip: () => !step.isQualified(data),
@@ -181,13 +197,18 @@ function createTask(
         data,
         reportStatus: (text) => !state.isFinished && (executor.output = text),
         updateTitle: (title) => !state.isFinished && (state.title = title),
-        pipeTagged(source, destination, { timestamp = true } = {}) {
+        pipeTagged(source, destination, { timestamp = true, letter } = {}) {
+          if (state.isFinished) {
+            throw new Error(`Task "${step.title}" is already finished`);
+          }
+          const prefix = (letter ?? "").slice(0, 1).toUpperCase();
           source
-            .pipe(addLinePrefix({ timestamp, tag: step.id }))
+            .pipe(addLinePrefix({ timestamp, tag: prefix + step.id }))
             .pipe(destination, { end: false });
         },
+        toolkit: runtime.toolkit,
       };
-      const job = dryRun ? Promise.resolve() : step.run(worker);
+      const job = runtime.dryRun ? Promise.resolve() : step.run(worker);
       const result = await Promise.race([job, periodicUpdate(state)]);
       state.isFinished = true;
       state.title = step.title;
@@ -208,9 +229,7 @@ function createTask(
             logger.log(ListrLogLevels.COMPLETED, executor.title);
           }
           return executor.newListr(
-            ready.map((next) =>
-              createTask(next, done, waiting, data, dryRun, logger)
-            )
+            ready.map((next) => createTask(next, runtime))
           );
         }
       }
