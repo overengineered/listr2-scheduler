@@ -1,7 +1,8 @@
 import { Readable, Transform } from "node:stream";
 import { EOL } from "node:os";
-import { gray, dim, yellow } from "colorette";
+import * as color from "colorette";
 import {
+  delay,
   Listr,
   ListrLogger,
   ListrLogLevels,
@@ -20,7 +21,9 @@ export type Worker = {
     source: Readable,
     destination: NodeJS.WritableStream,
     options?: { timestamp?: boolean; letter?: Letter }
-  );
+  ): void;
+  on(event: "finalize", callback: ErrorCallback<void>): void;
+  assertCanContinue(tag?: string): void;
   toolkit: Toolkit;
 };
 
@@ -29,12 +32,16 @@ export type Driver<Keys extends string> = {
     options: {
       printer: "verbose" | "vivid";
       dryRun?: boolean;
+      onError?: ShutdownMode | ErrorCallback<ShutdownMode>;
     } & (keyof Toolkit extends never
       ? { toolkit?: Toolkit }
       : { toolkit: Toolkit }),
     config?: Partial<Record<Keys, unknown>>
   ) => Promise<void>;
 };
+
+type ShutdownMode = "exit" | "finalize";
+type ErrorCallback<T = void> = (error: unknown, executor: unknown) => T;
 
 type Configurator<Keys extends string> = (
   when: Matcher<Keys>,
@@ -74,8 +81,13 @@ type Runtime = {
   waiting: Set<Step>;
   data: Record<string, unknown>;
   dryRun: boolean;
+  onError: ShutdownMode | ErrorCallback<ShutdownMode>;
   logger?: ListrLogger;
   toolkit: Toolkit;
+  failure?: { error: unknown };
+  startWorking(noticeError: ErrorCallback<void>): void;
+  endWorking(noticeError: ErrorCallback<void>): void;
+  finalize: ErrorCallback<Promise<unknown>>;
 };
 
 export function schedule<Keys extends string = string>(
@@ -122,14 +134,14 @@ export function schedule<Keys extends string = string>(
       const runnable = steps.filter((it) => it.isQualified(config ?? {}));
       const inputs = new Set(runnable.flatMap((step) => step.input));
       const done = new Set(
-        [...inputs].filter((key) => config && config[key] !== undefined)
+        [...inputs].filter((key) => config && config[key as Keys] !== undefined)
       );
       const isReady = (step: Step) => step.input.every((key) => done.has(key));
       for (const key of inputs) {
         validate(runnable, key, [], done, isReady);
       }
 
-      const logger = new CustomLogger();
+      const logger = new CustomLogger(options.onError !== "exit");
 
       if (options.printer === "verbose" && runnable.length < steps.length) {
         for (const skipped of steps) {
@@ -140,6 +152,27 @@ export function schedule<Keys extends string = string>(
       }
 
       const remaining = new Set(runnable);
+
+      let triggerExitSignal = (_?: unknown) => {};
+      const exitSignal = new Promise((res) => (triggerExitSignal = res));
+      const activeWorkers = new Set<ErrorCallback>();
+      const checkWorkers = () => {
+        // exitSignal can be sent before all work is complete:
+        // Some task schedules the last task, but before it starts working another
+        // task completes, triggering signal. It's OK when errors are encountered,
+        // the scheduled task will not begin.
+        if (activeWorkers.size + remaining.size === 0) {
+          triggerExitSignal();
+        }
+      };
+      const startWorking = (callback: ErrorCallback) => {
+        activeWorkers.add(callback);
+      };
+      const endWorking = (callback: ErrorCallback) => {
+        activeWorkers.delete(callback);
+        checkWorkers();
+      };
+
       const ready = runnable.filter(isReady);
       ready.forEach((step) => remaining.delete(step));
       const runtime: Runtime = {
@@ -147,8 +180,20 @@ export function schedule<Keys extends string = string>(
         done,
         waiting: remaining,
         dryRun: !!options.dryRun,
+        onError: options.onError ?? "finalize",
         logger: options.printer === "verbose" ? logger : undefined,
         toolkit: options.toolkit ?? {},
+        startWorking,
+        endWorking,
+        finalize: (error: unknown, executor: unknown) => {
+          if (!runtime.failure) {
+            runtime.failure = { error };
+            remaining.clear();
+            activeWorkers.forEach((callback) => callback(error, executor));
+            checkWorkers();
+          }
+          return exitSignal;
+        },
       };
       const tasks = ready.map((step) => createTask(step, runtime));
 
@@ -177,41 +222,134 @@ export function schedule<Keys extends string = string>(
   };
 }
 
+const Letters = "ABCDEFGHIJKLMOPQRSTUVWXYZ";
+const ColorWheel = [
+  color.bgYellow,
+  color.bgBlue,
+  color.bgMagenta,
+  color.bgGreen,
+  color.bgCyan,
+  color.bgBlack,
+];
+
 function createTask(step: Step, runtime: Runtime): ListrTask {
   const { data, done, waiting, logger } = runtime;
+  const stepTag = step.title + " " + color.yellow(step.id);
   return {
-    title: step.title + " " + yellow(step.id),
+    title: stepTag,
     skip: () => !step.isQualified(data),
     task: async (_, executor) => {
+      const num = Math.abs(parseInt(step.id.slice(1)));
+      const bg = ColorWheel[isNaN(num) ? 0 : num % ColorWheel.length];
       const state = {
         start: Date.now(),
         title: step.title,
         isFinished: false,
+        failure: undefined as { error: unknown } | undefined,
         update: () => {
           const passed = formatDuration(Date.now() - state.start);
-          executor.title = state.title + " " + dim(gray(passed));
+          executor.title =
+            state.title + " " + (state.failure ? color.red : color.dim)(passed);
         },
+        noticeError: (error: unknown, executor: unknown) => {
+          try {
+            state.registeredErrorListener(error, executor);
+          } catch (cascading) {
+            runtime.logger?.log(
+              color.red("~FAIL~"),
+              `${stepTag} Error on "finalize" ${getErrorDetails(cascading)}`
+            );
+          }
+        },
+        registeredErrorListener: (() => void 0) as ErrorCallback<void>,
       };
       undoTitleRewriteOnError(executor);
       const worker: Worker = {
         data,
-        reportStatus: (text) => !state.isFinished && (executor.output = text),
+        reportStatus: (text) =>
+          !state.isFinished &&
+          (executor.output = runtime.logger ? `${bg(step.id)} ${text}` : text),
         updateTitle: (title) => !state.isFinished && (state.title = title),
         pipeTagged(source, destination, { timestamp = true, letter } = {}) {
           if (state.isFinished) {
             throw new Error(`Task "${step.title}" is already finished`);
           }
-          const prefix = (letter ?? "").slice(0, 1).toUpperCase();
+          const position = Letters.indexOf(letter ?? "");
+          const prefix = position >= 0 ? Letters[position] : "";
           source
-            .pipe(addLinePrefix({ timestamp, tag: prefix + step.id }))
+            .pipe(addLinePrefix({ timestamp, tag: bg(prefix + step.id) }))
             .pipe(destination, { end: false });
+        },
+        on: (event, callback) =>
+          event === "finalize" && (state.registeredErrorListener = callback),
+        assertCanContinue: (tag) => {
+          if (runtime.failure) {
+            if (!runtime.logger && tag) {
+              executor.output = tag;
+            }
+            throw new Abort("CanContinue", false, tag);
+          }
         },
         toolkit: runtime.toolkit,
       };
-      const job = runtime.dryRun ? Promise.resolve() : step.run(worker);
-      const result = await Promise.race([job, periodicUpdate(state)]);
+      const execute = runtime.dryRun
+        ? () => Promise.resolve()
+        : runtime.onError === "exit"
+        ? () => step.run(worker)
+        : async () => {
+            if (runtime.failure) {
+              state.failure = { error: runtime.failure.error };
+              return;
+            }
+            try {
+              runtime.startWorking(state.noticeError);
+              await step.run(worker);
+              runtime.endWorking(state.noticeError);
+            } catch (error) {
+              runtime.endWorking(state.noticeError);
+              state.failure = { error };
+            }
+          };
+      const result = await Promise.race([execute(), periodicUpdate(state)]);
       state.isFinished = true;
       state.title = step.title;
+      if (state.failure) {
+        const isUnexpected = !isAssertion(state.failure.error, "CanContinue");
+        const details = isUnexpected
+          ? getErrorDetails(state.failure.error)
+          : String(state.failure.error);
+        if (runtime.logger) {
+          const level = isUnexpected ? color.red("~FAIL~") : "HALTED";
+          runtime.logger.log(level, `${stepTag} ${details}`);
+        } else {
+          if (isUnexpected) {
+            executor.output = String(state.failure.error);
+          }
+          state.update();
+        }
+        let shouldKillProcess = false;
+        if (typeof runtime.onError === "function") {
+          try {
+            const instruction = runtime.onError(state.failure.error, step.run);
+            shouldKillProcess = instruction === "exit";
+          } catch (cascading) {
+            const details = getErrorDetails(cascading);
+            const message = `Failed to handle error (${details})`;
+            runtime.logger?.log(color.red("~FAIL~"), `${stepTag} ${message}`);
+          }
+        }
+        if (!shouldKillProcess) {
+          await runtime.finalize(state.failure.error, step.run);
+          if (
+            !runtime.logger &&
+            state.failure.error !== runtime.failure?.error
+          ) {
+            // Listr2 ends with nicer summary if we don't rush with exception
+            await delay(500 + (num % 13) * 36);
+          }
+        }
+        throw runtime.failure?.error ?? state.failure?.error;
+      }
       !logger && (executor.output = "");
       state.update();
       if (step.output) {
@@ -229,7 +367,8 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
             logger.log(ListrLogLevels.COMPLETED, executor.title);
           }
           return executor.newListr(
-            ready.map((next) => createTask(next, runtime))
+            ready.map((next) => createTask(next, runtime)),
+            { concurrent: true }
           );
         }
       }
@@ -277,6 +416,34 @@ function periodicUpdate(state: { isFinished: boolean; update: () => void }) {
   return promise;
 }
 
+function getErrorDetails(error: unknown) {
+  if (error && error instanceof Error) {
+    return error.stack;
+  } else {
+    return String(error);
+  }
+}
+
+function isAssertion(error: unknown, condition: string) {
+  return (
+    error &&
+    typeof error === "object" &&
+    AssertionTag in error &&
+    error[AssertionTag] === condition
+  );
+}
+
+const AssertionTag = Symbol("AssertionTag");
+
+export class Abort extends Error {
+  [AssertionTag]: string;
+  constructor(condition: string, value: unknown, info?: string) {
+    super(`${condition}=${value}${info != null ? ` (${info})` : ""}`);
+    this.name = "Abort";
+    this[AssertionTag] = condition;
+  }
+}
+
 class CustomOutput extends ProcessOutput {
   toStdout(buffer: string, eol?: boolean): boolean {
     if (buffer) {
@@ -295,7 +462,7 @@ class CustomOutput extends ProcessOutput {
 class CustomLogger extends ListrLogger {
   skippable = new Set();
 
-  constructor() {
+  constructor(public omitFailMessages: boolean) {
     super({
       useIcons: false,
       processOutput: new CustomOutput(),
@@ -304,7 +471,7 @@ class CustomLogger extends ListrLogger {
           {
             condition: true,
             field: getFormattedTimestamp,
-            format: () => dim as never,
+            format: () => color.dim as never,
           },
         ],
       },
@@ -316,6 +483,9 @@ class CustomLogger extends ListrLogger {
     message: string | any[],
     options?: LoggerFieldOptions<false> | undefined
   ): string {
+    if (this.omitFailMessages && level === ListrLogLevels.FAILED) {
+      return "";
+    }
     if (level !== ListrLogLevels.COMPLETED || !this.skippable.has(message)) {
       level === ListrLogLevels.COMPLETED && this.skippable.add(message);
       const tag =
@@ -338,7 +508,7 @@ function undoTitleRewriteOnError(wrapper: any) {
   }
 }
 
-function customReport(error: unknown, type: unknown) {
+function customReport(this: any, error: unknown, type: unknown) {
   this.__LS__report?.(error, type);
   if (this.task?.title) {
     this.task.message$ = { error: this.task.title };
@@ -386,7 +556,7 @@ function addLinePrefix(options: {
 
       const diff = fragment ? now.getTime() - fragmentStart.getTime() : 0;
       const tag = options.tag ? options.tag + " " : "";
-      const prefix = `[${formatTimestamp(now)}] ${yellow(tag)}`;
+      const prefix = `[${formatTimestamp(now)}] ${tag}`;
 
       const timeInfo = formatTimestamp(fragmentStart);
       const age =
@@ -396,9 +566,7 @@ function addLinePrefix(options: {
       const displayTimeInfo =
         diff < 1000 ? timeInfo : timeInfo.slice(0, -age.length - 1) + "+" + age;
 
-      const fragmentPrefix = fragment
-        ? `[${displayTimeInfo}] ${yellow(tag)}`
-        : prefix;
+      const fragmentPrefix = fragment ? `[${displayTimeInfo}] ${tag}` : prefix;
 
       const lastLine = lines.at(-1);
       if (lastLine === "*") {
