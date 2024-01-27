@@ -13,8 +13,8 @@ import {
 
 export interface Toolkit {}
 
-export type Worker = {
-  data: any;
+export type Worker<T = any> = {
+  data: T;
   reportStatus(text: string): void;
   updateTitle(title: string): void;
   pipeTagged(

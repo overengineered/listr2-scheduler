@@ -82,13 +82,13 @@ schedule<"ci" | "silent" | "testResults" | "fmtResults">((when, make) => {
 }).run({ printer: ci ? "verbose" : "vivid" }, { ci, silent: false });
 ```
 
-For task to start all the input keys have to be provided either by config parameter
-(the second argument to run) or by another task as a result value. When task input key
-is prefixed with `?` the value provided must be truthy, when prefix is `!` value must be
-falsy. If value does not match requirements, task is skipped. When value there's no
-prefix any value for key is allowed, including `undefined` and `null`. However config
-parameter cannot provide `undefined` values. Any keys that are `undefined` in config must
-be provided by tasks.
+For task to start values for all the input keys have to be provided either by config
+parameter (the second argument to run) or by another task as a result value. When task
+input key is prefixed with `?` the value provided must be truthy, when prefix is `!` value
+must be falsy. If value does not match requirements, task is skipped. When there's no
+prefix in the key any value for that key is allowed, including `undefined` and `null`.
+However config passed to run cannot provide `undefined` values. Any keys that are
+`undefined` in config must be provided by tasks.
 
 ## Executor functions
 
@@ -96,8 +96,8 @@ Executor functions for `listr2-scheduler` receive one argument of type `Worker` 
 allows task to update task rendering and execution.
 
 ```TypeScript
-export type Worker = {
-  data: any;
+export type Worker<T = any> = {
+  data: T;
   reportStatus(text: string): void;
   updateTitle(title: string): void;
   pipeTagged(
