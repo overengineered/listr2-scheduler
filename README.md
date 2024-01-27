@@ -59,11 +59,14 @@ new Listr(
 ).run();
 ```
 
-## Configuration
-
 Besides `"vivid"` printer (which uses default Listr2 renderer with some customizations)
 `listr2-scheduler` offers only `"verbose"` alternative which prints all events with
 timestamp prefix.
+
+## Configuration
+
+When `call` is provided only executor function, it constructs task title from
+function name, but task title can be provided separately as shown below.
 
 Conditional tasks can be declared by using `?` or `!` prefix in input keys. Tasks can
 have more than one input. Tasks can have maximum one output.
@@ -76,27 +79,34 @@ schedule<"ci" | "silent" | "testResults" | "fmtResults">((when, make) => {
   when("!ci", make("testResults")).call("Quick tests", runQuickTests);
   when(null, make("fmtResults")).call("Check code formatting", runPrettier);
   when(["!ci", "!silent", "fmtResults", "testResults"]).call("Finish", showDoneAlert);
-}).run({ printer: ci ? "verbose" : "vivid" }, { ci });
+}).run({ printer: ci ? "verbose" : "vivid" }, { ci, silent: false });
 ```
 
-When `call` is provided only executor function, it constructs task title from
-function name, but task title can be provided separately as shown above.
+For task to start all the input keys have to be provided either by config parameter
+(the second argument to run) or by another task as a result value. When task input key
+is prefixed with `?` the value provided must be truthy, when prefix is `!` value must be
+falsy. If value does not match requirements, task is skipped. When value there's no
+prefix any value for key is allowed, including `undefined` and `null`. However config
+parameter cannot provide `undefined` values. Any keys that are `undefined` in config must
+be provided by tasks.
 
 ## Executor functions
 
 Executor functions for `listr2-scheduler` receive one argument of type `Worker` that
-supports narrower capabilities than functions executed with pure `Listr2`.
+allows task to update task rendering and execution.
 
 ```TypeScript
 export type Worker = {
-  data: Record<string, unknown>;
+  data: any;
   reportStatus(text: string): void;
   updateTitle(title: string): void;
   pipeTagged(
     source: Readable,
     destination: NodeJS.WritableStream,
-    options?: { timestamp?: boolean }
-  );
+    options?: { timestamp?: boolean; letter?: Letter }
+  ): void;
+  on(event: "finalize", callback: (error: unknown, executor: unknown) => void): void;
+  assertCanContinue(tag?: string): void;
   toolkit: Toolkit;
 };
 ```
@@ -117,6 +127,31 @@ const sub = execa("ping", ["-c", "3", "npmjs.com"]);
 sub.stdout && worker.pipeTagged(sub.stdout, process.stdout);
 sub.stderr && worker.pipeTagged(sub.stderr, process.stdout, { letter: 'E' });
 await sub;
+```
+
+- `on` allows executor to be informed about errors in other parallely running executors.
+  **NOTE**: Only the last registered callback will be invoked.
+
+```JavaScript
+async function prepareTestFiles(worker) {
+  const controller = new AbortController();
+  worker.on('finalize', () => controller.abort());
+  await fetch(testFilesBundleUrl, { signal: controller.signal });
+}
+```
+
+- `assertCanContinue` throws if some parallel executor has thrown an exception.
+
+```JavaScript
+async function analyzeSourceFiles(worker) {
+  let completed = 0;
+  for (const filePath of all) {
+    worker.reportStatus('Analyzing ' + filePath);
+    await analyzeFile(filePath);
+    completed += 1;
+    worker.assertCanContinue('Analyzed ' + completed + '/' + all.length);
+  }
+}
 ```
 
 - `toolkit` is by default an empty object. It's type can be augmented with TypeScript

@@ -14,7 +14,7 @@ import {
 export interface Toolkit {}
 
 export type Worker = {
-  data: Record<string, unknown>;
+  data: any;
   reportStatus(text: string): void;
   updateTitle(title: string): void;
   pipeTagged(
@@ -90,9 +90,10 @@ type Runtime = {
   finalize: ErrorCallback<Promise<unknown>>;
 };
 
-export function schedule<Keys extends string = string>(
-  define: Configurator<Keys>
-): Driver<Keys> {
+export function schedule<
+  Source = string,
+  Keys extends string = Source extends string ? Source : keyof Source & string
+>(define: Configurator<Keys>): Driver<Keys> {
   const steps: Step[] = [];
   const when: Matcher<Keys> = (
     condition: Pattern<Keys> | Pattern<Keys>[] | null,
