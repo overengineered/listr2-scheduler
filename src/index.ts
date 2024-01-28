@@ -19,13 +19,9 @@ export interface Toolkit {}
 export type Worker<T = any> = {
   readonly data: T;
   readonly printer: "verbose" | "vivid";
-  readonly reportStatus: (text: string) => void;
   readonly updateTitle: (title: string) => void;
-  readonly pipeTagged: (
-    source: Readable,
-    destination: NodeJS.WritableStream,
-    options?: { timestamp?: boolean; letter?: Letter }
-  ) => void;
+  readonly reportStatus: (text: string) => void;
+  readonly getTag: (options?: { colored: boolean }) => string;
   readonly on: (event: "finalize", callback: ErrorCallback<void>) => void;
   readonly assertCanContinue: (tag?: string) => void;
   readonly toolkit: Toolkit;
@@ -67,9 +63,6 @@ type Actions = {
 
 type Pattern<Keys extends string> = Keys | `?${Keys}` | `!${Keys}`;
 type Output<Keys> = { key: Keys };
-type _L1 = "A" | "B" | "C" | "D" | "E" | "F" | "G" | "H" | "I" | "J";
-type _L2 = "K" | "L" | "M" | "N" | "O" | "P" | "Q" | "R" | "S" | "T";
-type Letter = _L1 | _L2 | "U" | "V" | "W" | "X" | "Y" | "Z";
 
 type Step = {
   id: string;
@@ -272,19 +265,20 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       const worker: Worker = withToolkit(runtime.attach, {
         data,
         printer: runtime.logger ? "verbose" : "vivid",
-        reportStatus: (text) =>
-          !state.isFinished &&
-          (executor.output = runtime.logger ? `${bg(step.id)} ${text}` : text),
+        getTag: (options) => (options?.colored ? bg(step.id) : step.id),
         updateTitle: (title) => !state.isFinished && (state.title = title),
-        pipeTagged(source, destination, { timestamp = true, letter } = {}) {
-          if (state.isFinished) {
-            throw new Error(`Task "${step.title}" is already finished`);
+        reportStatus: (text) => {
+          if (state.isFinished) return;
+          const lines = text.split(/\r?\n/);
+          if (runtime.logger) {
+            lines.forEach(
+              (line) => (executor.output = `${bg(step.id)} ${line}`)
+            );
+          } else {
+            const message = lines.at(-1) ?? "";
+            executor.output =
+              message.length <= 80 ? message : "..." + message.slice(-77);
           }
-          const position = Letters.indexOf(letter ?? "");
-          const prefix = position >= 0 ? Letters[position] : "";
-          source
-            .pipe(addLinePrefix({ timestamp, tag: bg(prefix + step.id) }))
-            .pipe(destination, { end: false });
         },
         on: (event, callback) =>
           event === "finalize" && (state.registeredErrorListener = callback),
@@ -547,15 +541,72 @@ function formatTimestamp(time: Date) {
   );
 }
 
-function addLinePrefix(options: {
-  timestamp: boolean;
-  tag?: string;
-}): Transform {
+function formatTimeFrame([start, end]: Date[]): string {
+  const diff = end ? end.getTime() - start.getTime() : 0;
+  if (diff < 1000) {
+    return `[${formatTimestamp(start)}]`;
+  }
+
+  const prefix = formatTimestamp(start).slice(0, -4);
+  const age =
+    diff > 999000
+      ? (diff / 1000 / 60).toFixed(0) + "m"
+      : (diff / 1000).toFixed(0).padStart(3, "0");
+
+  return `[${prefix}${age.length !== 3 ? "####" : "+" + age}]`;
+}
+
+type DecoratorConfig = {
+  getTag: Worker["getTag"];
+  timestamp?: boolean;
+};
+
+export function decorateLines(
+  config: DecoratorConfig,
+  input: string | Readable
+): Transform;
+export function decorateLines(
+  config: DecoratorConfig,
+  input: string | Readable,
+  destination: NodeJS.WritableStream
+): NodeJS.WritableStream;
+export function decorateLines(
+  { getTag, timestamp }: DecoratorConfig,
+  input: string | Readable,
+  destination?: NodeJS.WritableStream
+): NodeJS.WritableStream {
+  const source = typeof input === "string" ? Readable.from(input) : input;
+  let lineTag: string | undefined;
+  const getLineTag = (): string => {
+    if (lineTag != null) {
+      return lineTag;
+    }
+    const tag = getTag({ colored: true }).split(/\r?\n/)[0];
+    lineTag = tag ? tag + " " : "";
+    return lineTag;
+  };
+  const transform = source.pipe(
+    createLineDecorator((timeFrame) => {
+      return timestamp === false
+        ? getLineTag()
+        : formatTimeFrame(timeFrame) + " " + getLineTag();
+    })
+  );
+  if (destination) {
+    return transform.pipe(destination, { end: false });
+  } else {
+    return transform;
+  }
+}
+
+export function createLineDecorator(
+  formatPrefix: (timeFrame: [Date] | [Date, Date]) => string
+): Transform {
   let fragment = "";
   let fragmentStart = new Date();
+
   function sendChunk(chunk: unknown, callback: (i: null, v: string) => void) {
     const now = new Date();
-
     const buffer = fragment + chunk + "*";
     const lines = buffer.split(/\r?\n/);
     if (lines.length === 1) {
@@ -565,20 +616,6 @@ function addLinePrefix(options: {
       return;
     }
 
-    const diff = fragment ? now.getTime() - fragmentStart.getTime() : 0;
-    const tag = options.tag ? options.tag + " " : "";
-    const prefix = `[${formatTimestamp(now)}] ${tag}`;
-
-    const timeInfo = formatTimestamp(fragmentStart);
-    const age =
-      diff > 999000
-        ? (diff / 1000 / 60).toFixed(1).padStart(6, "0")
-        : (diff / 1000).toFixed(0).padStart(3, "0");
-    const displayTimeInfo =
-      diff < 1000 ? timeInfo : timeInfo.slice(0, -age.length - 1) + "+" + age;
-
-    const fragmentPrefix = fragment ? `[${displayTimeInfo}] ${tag}` : prefix;
-
     const lastLine = lines.at(-1);
     if (lastLine === "*") {
       fragment = "";
@@ -587,8 +624,10 @@ function addLinePrefix(options: {
       fragmentStart = now;
     }
     lines.splice(lines.length - 1, 1);
-    const output = lines.join(EOL + prefix);
-    callback(null, fragmentPrefix + output + EOL);
+    const output =
+      formatPrefix(fragment ? [fragmentStart, now] : [now]) +
+      lines.join(EOL + formatPrefix([new Date()]));
+    callback(null, output + EOL);
   }
 
   return new Transform({
@@ -597,7 +636,7 @@ function addLinePrefix(options: {
     },
     flush(callback) {
       if (fragment) {
-        sendChunk("\n", callback);
+        sendChunk(EOL, callback);
       } else {
         callback(null, "");
       }

@@ -1,10 +1,12 @@
 # Opinionated library for declaring Listr2 task structure
 
 [Listr2](https://listr2.kilic.dev) is a very flexible library for running tasks that
-depend on each other and it allows presenting task status in a beatiful way.
+depend on each other and it allows presenting task status in a beautiful way.
 However declaring how to run those tasks is rather tedious. Listr2 has 4 renderers
-but neither is an optimal default for 2 common use cases where complex scripts are used:
-CI and developer machine. `listr2-scheduler` is an attempt to address those shortcomings.
+but to achieve better clarity they need to be customized. Listr2 supports parallel tasks,
+but exception in any of those terminates whole process. It's not obvious how to pipe
+output from external processes to Listr2 so that verbose logs are investigatable.
+`listr2-scheduler` is an attempt to address these shortcomings.
 
 ## Simple example
 
@@ -99,13 +101,9 @@ allows task to update task rendering and execution.
 export type Worker<T = any> = {
   readonly data: T;
   readonly printer: "verbose" | "vivid";
-  readonly reportStatus: (text: string) => void;
   readonly updateTitle: (title: string) => void;
-  readonly pipeTagged: (
-    source: Readable,
-    destination: NodeJS.WritableStream,
-    options?: { timestamp?: boolean; letter?: Letter }
-  ) => void;
+  readonly reportStatus: (text: string) => void;
+  readonly getTag: (options?: { colored: boolean }) => string;
   readonly on: (event: "finalize", callback: ErrorCallback<void>) => void;
   readonly assertCanContinue: (tag?: string) => void;
   readonly toolkit: Toolkit;
@@ -115,20 +113,23 @@ export type Worker<T = any> = {
 - `data` is an object that is given as a second argument to `run` function, and it
   is augmented by return values of executor functions.
 
-- `reportStatus` prints task status in both `"verbose"` and `"vivid"` modes.
-
 - `updateTitle` only updates task title in `"vivid"` mode.
 
-- `pipeTagged` allows piping output from subprocesses to stdout or stderr with worker
-  id and optionally with timestamp (default is with timestamp) and optionally with
-  identifier letter.
+- `reportStatus` prints task status in both `"verbose"` and `"vivid"` modes.
+
+- `getTag` returns worker tag that can be used to decorate piped output from external
+  processes to differentiate text coming from multiple parallel tasks.
 
 ```TypeScript
-worker.pipeTagged(Readable.from("Start pinging\n"), process.stdout);
-const sub = execa("ping", ["-c", "3", "npmjs.com"]);
-sub.stdout && worker.pipeTagged(sub.stdout, process.stdout);
-sub.stderr && worker.pipeTagged(sub.stderr, process.stdout, { letter: 'E' });
-await sub;
+import { decorateLines, Worker } from "listr2-scheduler";
+
+export function checkServerConnection(worker: Worker) {
+  decorateLines(worker, "Start pinging", process.stdout);
+  const sub = execa("ping", ["-c", "3", "npmjs.com"]);
+  sub.stdout && decorateLines(worker, sub.stdout, process.stdout);
+  sub.stderr && decorateLines(worker, sub.stderr, process.stderr);
+  await sub;
+}
 ```
 
 - `on` allows executor to be informed about errors in other parallely running executors.
