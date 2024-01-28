@@ -547,46 +547,54 @@ function addLinePrefix(options: {
 }): Transform {
   let fragment = "";
   let fragmentStart = new Date();
+  function sendChunk(chunk: unknown, callback: (i: null, v: string) => void) {
+    const now = new Date();
+
+    const buffer = fragment + chunk + "*";
+    const lines = buffer.split(/\r?\n/);
+    if (lines.length === 1) {
+      fragmentStart = fragment ? fragmentStart : now;
+      fragment = buffer.slice(0, -1);
+      callback(null, "");
+      return;
+    }
+
+    const diff = fragment ? now.getTime() - fragmentStart.getTime() : 0;
+    const tag = options.tag ? options.tag + " " : "";
+    const prefix = `[${formatTimestamp(now)}] ${tag}`;
+
+    const timeInfo = formatTimestamp(fragmentStart);
+    const age =
+      diff > 999000
+        ? (diff / 1000 / 60).toFixed(1).padStart(6, "0")
+        : (diff / 1000).toFixed(0).padStart(3, "0");
+    const displayTimeInfo =
+      diff < 1000 ? timeInfo : timeInfo.slice(0, -age.length - 1) + "+" + age;
+
+    const fragmentPrefix = fragment ? `[${displayTimeInfo}] ${tag}` : prefix;
+
+    const lastLine = lines.at(-1);
+    if (lastLine === "*") {
+      fragment = "";
+    } else {
+      fragment = lastLine?.slice(0, -1) ?? "";
+      fragmentStart = now;
+    }
+    lines.splice(lines.length - 1, 1);
+    const output = lines.join(EOL + prefix);
+    callback(null, fragmentPrefix + output + EOL);
+  }
+
   return new Transform({
     transform(chunk, encoding, callback) {
-      const now = new Date();
-
-      const buffer = fragment + chunk + "*";
-      const lines = buffer.split(/\r?\n/);
-      if (lines.length === 1) {
-        fragmentStart = fragment ? fragmentStart : now;
-        fragment = buffer.slice(0, -1);
-        callback(null, "");
-        return;
-      }
-
-      const diff = fragment ? now.getTime() - fragmentStart.getTime() : 0;
-      const tag = options.tag ? options.tag + " " : "";
-      const prefix = `[${formatTimestamp(now)}] ${tag}`;
-
-      const timeInfo = formatTimestamp(fragmentStart);
-      const age =
-        diff > 999000
-          ? (diff / 1000 / 60).toFixed(1).padStart(6, "0")
-          : (diff / 1000).toFixed(0).padStart(3, "0");
-      const displayTimeInfo =
-        diff < 1000 ? timeInfo : timeInfo.slice(0, -age.length - 1) + "+" + age;
-
-      const fragmentPrefix = fragment ? `[${displayTimeInfo}] ${tag}` : prefix;
-
-      const lastLine = lines.at(-1);
-      if (lastLine === "*") {
-        fragment = "";
-      } else {
-        fragment = lastLine?.slice(0, -1) ?? "";
-        fragmentStart = now;
-      }
-      lines.splice(lines.length - 1, 1);
-      const output = lines.join(EOL + prefix);
-      callback(null, fragmentPrefix + output + EOL);
+      sendChunk(chunk, callback);
     },
     flush(callback) {
-      callback(null, fragment);
+      if (fragment) {
+        sendChunk("\n", callback);
+      } else {
+        callback(null, "");
+      }
     },
   });
 }
