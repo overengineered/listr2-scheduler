@@ -97,17 +97,18 @@ allows task to update task rendering and execution.
 
 ```TypeScript
 export type Worker<T = any> = {
-  data: T;
-  reportStatus(text: string): void;
-  updateTitle(title: string): void;
-  pipeTagged(
+  readonly data: T;
+  readonly printer: "verbose" | "vivid";
+  readonly reportStatus: (text: string) => void;
+  readonly updateTitle: (title: string) => void;
+  readonly pipeTagged: (
     source: Readable,
     destination: NodeJS.WritableStream,
     options?: { timestamp?: boolean; letter?: Letter }
-  ): void;
-  on(event: "finalize", callback: (error: unknown, executor: unknown) => void): void;
-  assertCanContinue(tag?: string): void;
-  toolkit: Toolkit;
+  ) => void;
+  readonly on: (event: "finalize", callback: ErrorCallback<void>) => void;
+  readonly assertCanContinue: (tag?: string) => void;
+  readonly toolkit: Toolkit;
 };
 ```
 
@@ -123,6 +124,7 @@ export type Worker<T = any> = {
   identifier letter.
 
 ```TypeScript
+worker.pipeTagged(Readable.from("Start pinging"), process.stdout);
 const sub = execa("ping", ["-c", "3", "npmjs.com"]);
 sub.stdout && worker.pipeTagged(sub.stdout, process.stdout);
 sub.stderr && worker.pipeTagged(sub.stderr, process.stdout, { letter: 'E' });

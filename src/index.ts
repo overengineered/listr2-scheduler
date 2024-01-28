@@ -13,18 +13,22 @@ import {
 
 export interface Toolkit {}
 
+/**
+ * See https://github.com/overengineered/listr2-scheduler#executor-functions
+ */
 export type Worker<T = any> = {
-  data: T;
-  reportStatus(text: string): void;
-  updateTitle(title: string): void;
-  pipeTagged(
+  readonly data: T;
+  readonly printer: "verbose" | "vivid";
+  readonly reportStatus: (text: string) => void;
+  readonly updateTitle: (title: string) => void;
+  readonly pipeTagged: (
     source: Readable,
     destination: NodeJS.WritableStream,
     options?: { timestamp?: boolean; letter?: Letter }
-  ): void;
-  on(event: "finalize", callback: ErrorCallback<void>): void;
-  assertCanContinue(tag?: string): void;
-  toolkit: Toolkit;
+  ) => void;
+  readonly on: (event: "finalize", callback: ErrorCallback<void>) => void;
+  readonly assertCanContinue: (tag?: string) => void;
+  readonly toolkit: Toolkit;
 };
 
 export type Driver<Keys extends string> = {
@@ -267,6 +271,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       undoTitleRewriteOnError(executor);
       const worker: Worker = {
         data,
+        printer: runtime.logger ? "verbose" : "vivid",
         reportStatus: (text) =>
           !state.isFinished &&
           (executor.output = runtime.logger ? `${bg(step.id)} ${text}` : text),
