@@ -39,7 +39,7 @@ export type Driver<Keys extends string> = {
       onError?: ShutdownMode | ErrorCallback<ShutdownMode>;
     } & (keyof Toolkit extends never
       ? { toolkit?: Toolkit }
-      : { toolkit: Toolkit }),
+      : { toolkit: Toolkit } | { attach: (worker: Worker) => Toolkit }),
     config?: Partial<Record<Keys, unknown>>
   ) => Promise<void>;
 };
@@ -87,7 +87,7 @@ type Runtime = {
   dryRun: boolean;
   onError: ShutdownMode | ErrorCallback<ShutdownMode>;
   logger?: ListrLogger;
-  toolkit: Toolkit;
+  attach: (worker: Omit<Worker, "toolkit">) => Toolkit;
   failure?: { error: unknown };
   startWorking(noticeError: ErrorCallback<void>): void;
   endWorking(noticeError: ErrorCallback<void>): void;
@@ -187,7 +187,7 @@ export function schedule<
         dryRun: !!options.dryRun,
         onError: options.onError ?? "finalize",
         logger: options.printer === "verbose" ? logger : undefined,
-        toolkit: options.toolkit ?? {},
+        attach: (options as any).attach ?? (() => options.toolkit ?? {}),
         startWorking,
         endWorking,
         finalize: (error: unknown, executor: unknown) => {
@@ -269,7 +269,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
         registeredErrorListener: (() => void 0) as ErrorCallback<void>,
       };
       undoTitleRewriteOnError(executor);
-      const worker: Worker = {
+      const worker: Worker = withToolkit(runtime.attach, {
         data,
         printer: runtime.logger ? "verbose" : "vivid",
         reportStatus: (text) =>
@@ -296,8 +296,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
             throw new Abort("CanContinue", false, tag);
           }
         },
-        toolkit: runtime.toolkit,
-      };
+      });
       const execute = runtime.dryRun
         ? () => Promise.resolve()
         : runtime.onError === "exit"
@@ -406,6 +405,13 @@ function validate(
       validate(steps, target, optionPath, done, isRoot);
     }
   }
+}
+
+function withToolkit(
+  getToolkit: (worker: Omit<Worker, "toolkit">) => Toolkit,
+  worker: Omit<Worker, "toolkit">
+): Worker {
+  return Object.assign(worker, { toolkit: getToolkit(worker) });
 }
 
 function periodicUpdate(state: { isFinished: boolean; update: () => void }) {

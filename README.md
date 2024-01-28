@@ -124,7 +124,7 @@ export type Worker<T = any> = {
   identifier letter.
 
 ```TypeScript
-worker.pipeTagged(Readable.from("Start pinging"), process.stdout);
+worker.pipeTagged(Readable.from("Start pinging\n"), process.stdout);
 const sub = execa("ping", ["-c", "3", "npmjs.com"]);
 sub.stdout && worker.pipeTagged(sub.stdout, process.stdout);
 sub.stderr && worker.pipeTagged(sub.stderr, process.stdout, { letter: 'E' });
@@ -157,7 +157,8 @@ async function analyzeSourceFiles(worker) {
 ```
 
 - `toolkit` is by default an empty object. It's type can be augmented with TypeScript
-  declaration and it can be provided with an argument to `run`.
+  declaration and it can be provided as an argument to `run` directly or via constructor
+  function `attach`.
 
 ```TypeScript
 import { schedule } from "listr2-scheduler";
