@@ -1,6 +1,6 @@
 {
   "name": "listr2-scheduler",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "Declarative Listr2 task scheduling",
   "main": "dist/index.js",
   "files": [

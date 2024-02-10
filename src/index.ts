@@ -21,6 +21,7 @@ export type Worker<T = any> = {
   readonly printer: "verbose" | "vivid";
   readonly updateTitle: (title: string) => void;
   readonly reportStatus: (text: string) => void;
+  readonly publish: (text: string) => void;
   readonly getTag: (options?: { colored: boolean }) => string;
   readonly on: (event: "finalize", callback: ErrorCallback<void>) => void;
   readonly assertCanContinue: (tag?: string) => void;
@@ -82,10 +83,13 @@ type Runtime = {
   logger?: ListrLogger;
   attach: (worker: Omit<Worker, "toolkit">) => Toolkit;
   failure?: { error: unknown };
-  startWorking(noticeError: ErrorCallback<void>): void;
-  endWorking(noticeError: ErrorCallback<void>): void;
+  publish: (lines: string[]) => void;
+  startWorking: (noticeError: ErrorCallback<void>) => void;
+  endWorking: (noticeError: ErrorCallback<void>) => void;
   finalize: ErrorCallback<Promise<unknown>>;
 };
+
+const LS = /\r?\n/;
 
 export function schedule<
   Source = string,
@@ -151,6 +155,8 @@ export function schedule<
 
       const remaining = new Set(runnable);
 
+      const board: string[] = [];
+      let shouldPrintBoard = false;
       let triggerExitSignal = (_?: unknown) => {};
       const exitSignal = new Promise((res) => (triggerExitSignal = res));
       const activeWorkers = new Set<ErrorCallback>();
@@ -160,6 +166,9 @@ export function schedule<
         // task completes, triggering signal. It's OK when errors are encountered,
         // the scheduled task will not begin.
         if (activeWorkers.size + remaining.size === 0) {
+          if (shouldPrintBoard) {
+            board.forEach((line) => process.stdout.write(line + EOL));
+          }
           triggerExitSignal();
         }
       };
@@ -181,10 +190,12 @@ export function schedule<
         onError: options.onError ?? "finalize",
         logger: options.printer === "verbose" ? logger : undefined,
         attach: (options as any).attach ?? (() => options.toolkit ?? {}),
+        publish: (lines) => board.push(...lines),
         startWorking,
         endWorking,
         finalize: (error: unknown, executor: unknown) => {
           if (!runtime.failure) {
+            shouldPrintBoard = true;
             runtime.failure = { error };
             remaining.clear();
             activeWorkers.forEach((callback) => callback(error, executor));
@@ -215,12 +226,12 @@ export function schedule<
             }),
       }).run();
 
+      board.forEach((line) => process.stdout.write(line + EOL));
       logger.log("FINISHED", formatDuration(Date.now() - start));
     },
   };
 }
 
-const Letters = "ABCDEFGHIJKLMOPQRSTUVWXYZ";
 const ColorWheel = [
   color.bgYellow,
   color.bgBlue,
@@ -244,6 +255,13 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
         title: step.title,
         isFinished: false,
         failure: undefined as { error: unknown } | undefined,
+        log: [] as string[],
+        publishLog: () => {
+          if (state.log.length > 0) {
+            state.log.unshift(`___ ${step.title.split(LS).join(" ")} ___`);
+            runtime.publish(state.log);
+          }
+        },
         update: () => {
           const passed = formatDuration(Date.now() - state.start);
           executor.title =
@@ -267,9 +285,9 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
         printer: runtime.logger ? "verbose" : "vivid",
         getTag: (options) => (options?.colored ? bg(step.id) : step.id),
         updateTitle: (title) => !state.isFinished && (state.title = title),
-        reportStatus: (text) => {
+        reportStatus: (status) => {
           if (state.isFinished) return;
-          const lines = text.split(/\r?\n/);
+          const lines = String(status).split(LS);
           if (runtime.logger) {
             lines.forEach(
               (line) => (executor.output = `${bg(step.id)} ${line}`)
@@ -278,6 +296,16 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
             const message = lines.at(-1) ?? "";
             executor.output =
               message.length <= 80 ? message : "..." + message.slice(-77);
+          }
+        },
+        publish: (message) => {
+          if (state.isFinished) return;
+          const text = String(message);
+          if (runtime.logger) {
+            runtime.logger?.log("PUBLISH", `${bg(step.id)}`);
+            process.stdout.write(text.endsWith(EOL) ? text : text + EOL);
+          } else {
+            state.log.push(text);
           }
         },
         on: (event, callback) =>
@@ -347,10 +375,12 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
             await delay(500 + (num % 13) * 36);
           }
         }
+        state.publishLog();
         throw runtime.failure?.error ?? state.failure?.error;
       }
       !logger && (executor.output = "");
       state.update();
+      state.publishLog();
       if (step.output) {
         data[step.output.key] = result;
         done.add(step.output.key);
@@ -581,7 +611,7 @@ export function decorateLines(
     if (lineTag != null) {
       return lineTag;
     }
-    const tag = getTag({ colored: true }).split(/\r?\n/)[0];
+    const tag = getTag({ colored: true }).split(LS)[0];
     lineTag = tag ? tag + " " : "";
     return lineTag;
   };
@@ -608,7 +638,7 @@ export function createLineDecorator(
   function sendChunk(chunk: unknown, callback: (i: null, v: string) => void) {
     const now = new Date();
     const buffer = fragment + chunk + "*";
-    const lines = buffer.split(/\r?\n/);
+    const lines = buffer.split(LS);
     if (lines.length === 1) {
       fragmentStart = fragment ? fragmentStart : now;
       fragment = buffer.slice(0, -1);

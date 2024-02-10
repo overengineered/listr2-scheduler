@@ -103,6 +103,7 @@ export type Worker<T = any> = {
   readonly printer: "verbose" | "vivid";
   readonly updateTitle: (title: string) => void;
   readonly reportStatus: (text: string) => void;
+  readonly publish: (text: string) => void;
   readonly getTag: (options?: { colored: boolean }) => string;
   readonly on: (event: "finalize", callback: ErrorCallback<void>) => void;
   readonly assertCanContinue: (tag?: string) => void;
@@ -116,6 +117,10 @@ export type Worker<T = any> = {
 - `updateTitle` only updates task title in `"vivid"` mode.
 
 - `reportStatus` prints task status in both `"verbose"` and `"vivid"` modes.
+
+- `publish` in vivid mode prints provided message at the end, in verbose mode prints
+  provided message without any prefixes. Useful for warnings and similar important
+  messages.
 
 - `getTag` returns worker tag that can be used to decorate piped output from external
   processes to differentiate text coming from multiple parallel tasks.
