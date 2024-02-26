@@ -67,7 +67,7 @@ type Pattern<Keys extends string> = Keys | `?${Keys}` | `!${Keys}`;
 type Output<Keys> = { key: Keys };
 
 type Step = {
-  id: string;
+  definitionId: number;
   title: string;
   isQualified: (config: Record<string, unknown>) => boolean;
   input: string[];
@@ -82,6 +82,7 @@ type Runtime = {
   dryRun: boolean;
   onError: ShutdownMode | ErrorCallback<ShutdownMode>;
   logger?: ListrLogger;
+  issueId(): string;
   attach: (worker: Omit<Worker, "toolkit">) => Toolkit;
   failure?: { error: unknown };
   publish: (lines: string[]) => void;
@@ -105,7 +106,7 @@ export function schedule<
       nameSource: ((worker: Worker) => unknown) | string,
       fn?: (worker: Worker) => unknown
     ) => {
-      const id = `@${String(steps.length + 1).padStart(2, "0")}`;
+      const definitionId = steps.length;
       const run = typeof nameSource === "function" ? nameSource : nonNull(fn);
       const title = typeof nameSource === "string" ? nameSource : getTitle(run);
       const input: string[] = [];
@@ -125,7 +126,7 @@ export function schedule<
             state[condition.key] === undefined ||
             !!state[condition.key] === condition.expect
         );
-      steps.push({ id, title, isQualified, input, output, run });
+      steps.push({ definitionId, title, isQualified, input, output, run });
     },
   });
   const make: (key: Keys) => Output<Keys> = (key) => ({ key });
@@ -183,6 +184,7 @@ export function schedule<
 
       const ready = runnable.filter(isReady);
       ready.forEach((step) => remaining.delete(step));
+      let nextId = 1;
       const runtime: Runtime = {
         data: { ...config },
         done,
@@ -190,6 +192,11 @@ export function schedule<
         dryRun: !!options.dryRun,
         onError: options.onError ?? "finalize",
         logger: options.printer === "verbose" ? logger : undefined,
+        issueId: () => {
+          const result = `@${String(nextId).padStart(2, "0")}`;
+          nextId += 1;
+          return result;
+        },
         attach: (options as any).attach ?? (() => options.toolkit ?? {}),
         publish: (lines) => board.push(...lines),
         startWorking,
@@ -244,12 +251,13 @@ const ColorWheel = [
 
 function createTask(step: Step, runtime: Runtime): ListrTask {
   const { data, done, waiting, logger } = runtime;
-  const stepTag = step.title + " " + color.yellow(step.id);
+  const stepId = runtime.issueId();
+  const stepTag = step.title + " " + color.yellow(stepId);
   return {
     title: stepTag,
     skip: () => !step.isQualified(data),
     task: async (_, executor) => {
-      const num = Math.abs(parseInt(step.id.slice(1)));
+      const num = step.definitionId;
       const bg = ColorWheel[isNaN(num) ? 0 : num % ColorWheel.length];
       const state = {
         start: Date.now(),
@@ -291,7 +299,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       const worker: Worker = withToolkit(runtime.attach, {
         data,
         printer: runtime.logger ? "verbose" : "summary",
-        getTag: (options) => (options?.colored ? bg(step.id) : step.id),
+        getTag: (options) => (options?.colored ? bg(stepId) : stepId),
         updateTitle: (title) =>
           !state.isFinished && ((state.title = title), (state.suffix = "")),
         setTitleSuffix: (suffix) =>
@@ -301,7 +309,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           const lines = String(status).split(LS);
           if (runtime.logger) {
             lines.forEach(
-              (line) => (executor.output = `${bg(step.id)} ${line}`)
+              (line) => (executor.output = `${bg(stepId)} ${line}`)
             );
           } else {
             const message = lines.at(-1) ?? "";
@@ -313,7 +321,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           if (state.isFinished) return;
           const text = String(message);
           if (runtime.logger) {
-            runtime.logger?.log("PUBLISH", `${bg(step.id)}`);
+            runtime.logger?.log("PUBLISH", `${bg(stepId)}`);
             process.stdout.write(text.endsWith(EOL) ? text : text + EOL);
           } else {
             state.log.push(text);
