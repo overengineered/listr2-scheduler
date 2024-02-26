@@ -19,7 +19,7 @@ const driver = schedule((when, make) => {
   when("bundle").call(uploadBundleMapFileForCrashAnalytics);
 });
 
-driver.run({ printer: "vivid" });
+driver.run({ printer: "summary" });
 ```
 
 Hopefully it's obvious that `createAppBundle` function will be executed at the beginning
@@ -61,7 +61,7 @@ new Listr(
 ).run();
 ```
 
-Besides `"vivid"` printer (which uses default Listr2 renderer with some customizations)
+Besides `"summary"` printer (which uses default Listr2 renderer with some customizations)
 `listr2-scheduler` offers only `"verbose"` alternative which prints all events with
 timestamp prefix.
 
@@ -81,7 +81,7 @@ schedule<"ci" | "silent" | "testResults" | "fmtResults">((when, make) => {
   when("!ci", make("testResults")).call("Quick tests", runQuickTests);
   when(null, make("fmtResults")).call("Check code formatting", runPrettier);
   when(["!ci", "!silent", "fmtResults", "testResults"]).call("Finish", showDoneAlert);
-}).run({ printer: ci ? "verbose" : "vivid" }, { ci, silent: false });
+}).run({ printer: ci ? "verbose" : "summary" }, { ci, silent: false });
 ```
 
 For task to start values for all the input keys have to be provided either by config
@@ -100,7 +100,8 @@ allows task to update task rendering and execution.
 ```TypeScript
 export type Worker<T = any> = {
   readonly data: T;
-  readonly printer: "verbose" | "vivid";
+  readonly printer: "verbose" | "summary";
+  readonly setTitleSuffix: (suffix: string) => void;
   readonly updateTitle: (title: string) => void;
   readonly reportStatus: (text: string) => void;
   readonly publish: (text: string) => void;
@@ -114,12 +115,16 @@ export type Worker<T = any> = {
 - `data` is an object that is given as a second argument to `run` function, and it
   is augmented by return values of executor functions.
 
-- `updateTitle` only updates task title in `"vivid"` mode.
+- `setTitleSuffix` appends to task title in `"summary"` mode. Suffix remains in the final
+  `"summary"` report.
 
-- `reportStatus` prints task status in both `"verbose"` and `"vivid"` modes.
+- `updateTitle` updates task title in `"summary"` mode. Clears title suffix. Title
+  get restored to original in final `"summary"` report.
 
-- `publish` in vivid mode prints provided message at the end, in verbose mode prints
-  provided message without any prefixes. Useful for warnings and similar important
+- `reportStatus` prints task status in both `"verbose"` and `"summary"` modes.
+
+- `publish` in `"summary"` mode prints provided message at the end, in `"verbose"` mode
+  prints provided message without any prefixes. Useful for warnings and similar important
   messages.
 
 - `getTag` returns worker tag that can be used to decorate piped output from external

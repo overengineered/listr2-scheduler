@@ -18,7 +18,8 @@ export interface Toolkit {}
  */
 export type Worker<T = any> = {
   readonly data: T;
-  readonly printer: "verbose" | "vivid";
+  readonly printer: "verbose" | "summary";
+  readonly setTitleSuffix: (suffix: string) => void;
   readonly updateTitle: (title: string) => void;
   readonly reportStatus: (text: string) => void;
   readonly publish: (text: string) => void;
@@ -31,7 +32,7 @@ export type Worker<T = any> = {
 export type Driver<Keys extends string> = {
   run: (
     options: {
-      printer: "verbose" | "vivid";
+      printer: "verbose" | "summary";
       dryRun?: boolean;
       onError?: ShutdownMode | ErrorCallback<ShutdownMode>;
     } & (keyof Toolkit extends never
@@ -209,19 +210,19 @@ export function schedule<
       const start = Date.now();
       await new Listr(tasks, {
         concurrent: true,
-        ...(options.printer === "vivid"
+        ...(options.printer === "verbose"
           ? {
+              renderer: "verbose",
+              rendererOptions: {
+                logger,
+              },
+            }
+          : {
               renderer: "default",
               collapseSkips: false,
               rendererOptions: {
                 collapseSubtasks: false,
                 formatOutput: "truncate",
-              },
-            }
-          : {
-              renderer: "verbose",
-              rendererOptions: {
-                logger,
               },
             }),
       }).run();
@@ -253,9 +254,14 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       const state = {
         start: Date.now(),
         title: step.title,
+        suffix: "",
         isFinished: false,
         failure: undefined as { error: unknown } | undefined,
         log: [] as string[],
+        withSuffix: (title: string) =>
+          state.suffix.startsWith(" ") || state.suffix.length === 0
+            ? title + state.suffix
+            : title + " " + state.suffix,
         publishLog: () => {
           if (state.log.length > 0) {
             state.log.unshift(`___ ${step.title.split(LS).join(" ")} ___`);
@@ -265,7 +271,9 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
         update: () => {
           const passed = formatDuration(Date.now() - state.start);
           executor.title =
-            state.title + " " + (state.failure ? color.red : color.dim)(passed);
+            state.withSuffix(state.title) +
+            " " +
+            (state.failure ? color.red : color.dim)(passed);
         },
         noticeError: (error: unknown, executor: unknown) => {
           try {
@@ -282,9 +290,12 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       undoTitleRewriteOnError(executor);
       const worker: Worker = withToolkit(runtime.attach, {
         data,
-        printer: runtime.logger ? "verbose" : "vivid",
+        printer: runtime.logger ? "verbose" : "summary",
         getTag: (options) => (options?.colored ? bg(step.id) : step.id),
-        updateTitle: (title) => !state.isFinished && (state.title = title),
+        updateTitle: (title) =>
+          !state.isFinished && ((state.title = title), (state.suffix = "")),
+        setTitleSuffix: (suffix) =>
+          !state.isFinished && (state.suffix = suffix),
         reportStatus: (status) => {
           if (state.isFinished) return;
           const lines = String(status).split(LS);
