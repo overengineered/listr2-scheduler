@@ -82,7 +82,9 @@ type Runtime = {
   dryRun: boolean;
   onError: ShutdownMode | ErrorCallback<ShutdownMode>;
   logger?: ListrLogger;
-  issueId(): string;
+  issueId: () => string;
+  selectColor: (id: number) => color.Color;
+  releaseColor: (id: number) => void;
   attach: (worker: Omit<Worker, "toolkit">) => Toolkit;
   failure?: { error: unknown };
   publish: (lines: string[]) => void;
@@ -185,6 +187,9 @@ export function schedule<
       const ready = runnable.filter(isReady);
       ready.forEach((step) => remaining.delete(step));
       let nextId = 1;
+      let nextColor = 0;
+      const colorCounters = ColorWheel.map(() => 0);
+      const colorMapping = new Map<number, number>();
       const runtime: Runtime = {
         data: { ...config },
         done,
@@ -196,6 +201,31 @@ export function schedule<
           const result = `@${String(nextId).padStart(2, "0")}`;
           nextId += 1;
           return result;
+        },
+        selectColor: (id) => {
+          const preselected = colorMapping.get(id);
+          if (preselected !== undefined) {
+            return ColorWheel[preselected];
+          }
+          if (colorCounters[nextColor] === 0) {
+            colorCounters[nextColor] += 1;
+            const result = ColorWheel[nextColor];
+            colorMapping.set(id, nextColor);
+            nextColor = (nextColor + 1) % colorCounters.length;
+            return result;
+          } else {
+            const index = Math.abs(id) % colorCounters.length;
+            colorCounters[index] += 1;
+            colorMapping.set(id, index);
+            nextColor = (index + 1) % colorCounters.length;
+            return ColorWheel[index];
+          }
+        },
+        releaseColor: (id) => {
+          const preselected = colorMapping.get(id);
+          if (preselected) {
+            colorCounters[preselected] -= 1;
+          }
         },
         attach: (options as any).attach ?? (() => options.toolkit ?? {}),
         publish: (lines) => board.push(...lines),
@@ -257,8 +287,6 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
     title: stepTag,
     skip: () => !step.isQualified(data),
     task: async (_, executor) => {
-      const num = step.definitionId;
-      const bg = ColorWheel[isNaN(num) ? 0 : num % ColorWheel.length];
       const state = {
         start: Date.now(),
         title: step.title,
@@ -299,7 +327,10 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       const worker: Worker = withToolkit(runtime.attach, {
         data,
         printer: runtime.logger ? "verbose" : "summary",
-        getTag: (options) => (options?.colored ? bg(stepId) : stepId),
+        getTag: (options) =>
+          options?.colored
+            ? runtime.selectColor(step.definitionId)(stepId)
+            : stepId,
         updateTitle: (title) =>
           !state.isFinished && ((state.title = title), (state.suffix = "")),
         setTitleSuffix: (suffix) =>
@@ -308,6 +339,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           if (state.isFinished) return;
           const lines = String(status).split(LS);
           if (runtime.logger) {
+            const bg = runtime.selectColor(step.definitionId);
             lines.forEach(
               (line) => (executor.output = `${bg(stepId)} ${line}`)
             );
@@ -321,6 +353,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           if (state.isFinished) return;
           const text = String(message);
           if (runtime.logger) {
+            const bg = runtime.selectColor(step.definitionId);
             runtime.logger?.log("PUBLISH", `${bg(stepId)}`);
             process.stdout.write(text.endsWith(EOL) ? text : text + EOL);
           } else {
@@ -359,6 +392,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       const result = await Promise.race([execute(), periodicUpdate(state)]);
       state.isFinished = true;
       state.title = step.title;
+      runtime.releaseColor(step.definitionId);
       if (state.failure) {
         const isUnexpected = !isAssertion(state.failure.error, "CanContinue");
         const details = isUnexpected
@@ -391,7 +425,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
             state.failure.error !== runtime.failure?.error
           ) {
             // Listr2 ends with nicer summary if we don't rush with exception
-            await delay(500 + (num % 13) * 36);
+            await delay(500 + (step.definitionId % 13) * 36);
           }
         }
         state.publishLog();
