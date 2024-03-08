@@ -161,8 +161,11 @@ export function schedule<
 
       const board: string[] = [];
       let shouldPrintBoard = false;
-      let triggerExitSignal = (_?: unknown) => {};
-      const exitSignal = new Promise((res) => (triggerExitSignal = res));
+      let sendExitSignal = (_?: Error) => {};
+      let exitValue: Error | undefined;
+      const exitSignal = new Promise((resolve, reject) => {
+        sendExitSignal = (e) => (e ? reject(e) : resolve(null));
+      });
       const activeWorkers = new Set<ErrorCallback>();
       const checkWorkers = () => {
         // exitSignal can be sent before all work is complete:
@@ -173,7 +176,7 @@ export function schedule<
           if (shouldPrintBoard) {
             board.forEach((line) => process.stdout.write(line + EOL));
           }
-          triggerExitSignal();
+          sendExitSignal(exitValue);
         }
       };
       const startWorking = (callback: ErrorCallback) => {
@@ -239,14 +242,34 @@ export function schedule<
             activeWorkers.forEach((callback) => callback(error, executor));
             checkWorkers();
           }
-          return exitSignal;
+          return exitSignal.catch(() => null);
         },
       };
       const tasks = ready.map((step) => createTask(step, runtime));
+      tasks.push({
+        task: async (_, listr) => {
+          await exitSignal.catch((e) => {
+            listr.title = "×××";
+            throw e;
+          });
+        },
+      });
 
       const start = Date.now();
+      process.on("SIGINT", () => {
+        process.stderr.write(`\n`);
+        if (!runtime.failure) {
+          exitValue = new Interrupt("SIGINT");
+          if (runtime.logger) {
+            const msg = color.red("SIGINT received, finalize");
+            runtime.logger.log("SIGNAL", msg);
+          }
+          runtime.finalize(exitValue, null);
+        }
+      });
       await new Listr(tasks, {
         concurrent: true,
+        registerSignalListeners: false,
         ...(options.printer === "verbose"
           ? {
               renderer: "verbose",
@@ -282,7 +305,7 @@ const ColorWheel = [
 function createTask(step: Step, runtime: Runtime): ListrTask {
   const { data, done, waiting, logger } = runtime;
   const stepId = runtime.issueId();
-  const stepTag = step.title + " " + color.yellow(stepId);
+  const stepTag = step.title + " " + color.cyan(stepId);
   return {
     title: stepTag,
     skip: () => !step.isQualified(data),
@@ -309,11 +332,14 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           executor.title =
             state.withSuffix(state.title) +
             " " +
-            (state.failure ? color.red : color.dim)(passed);
+            (state.failure || runtime.failure ? color.red : color.dim)(passed);
         },
-        noticeError: (error: unknown, executor: unknown) => {
+        noticeError: (error: unknown, source: unknown) => {
+          if (!runtime.logger) {
+            executor.output = color.bold(color.red(`Waiting to finalize`));
+          }
           try {
-            state.registeredErrorListener(error, executor);
+            state.registeredErrorListener(error, source);
           } catch (cascading) {
             runtime.logger?.log(
               color.red("~FAIL~"),
@@ -337,6 +363,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           !state.isFinished && (state.suffix = suffix),
         reportStatus: (status) => {
           if (state.isFinished) return;
+          if (runtime.failure && !runtime.logger) return;
           const lines = String(status).split(LS);
           if (runtime.logger) {
             const bg = runtime.selectColor(step.definitionId);
@@ -367,7 +394,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
             if (!runtime.logger && tag) {
               executor.output = tag;
             }
-            throw new Abort("CanContinue", false, tag);
+            throw new Interrupt("CanContinue", false, tag);
           }
         },
       });
@@ -394,7 +421,7 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
       state.title = step.title;
       runtime.releaseColor(step.definitionId);
       if (state.failure) {
-        const isUnexpected = !isAssertion(state.failure.error, "CanContinue");
+        const isUnexpected = !isInterrupt(state.failure.error);
         const details = isUnexpected
           ? getErrorDetails(state.failure.error)
           : String(state.failure.error);
@@ -419,13 +446,14 @@ function createTask(step: Step, runtime: Runtime): ListrTask {
           }
         }
         if (!shouldKillProcess) {
+          executor.output = color.bold(color.red(`Failed`));
           await runtime.finalize(state.failure.error, step.run);
           if (
             !runtime.logger &&
             state.failure.error !== runtime.failure?.error
           ) {
             // Listr2 ends with nicer summary if we don't rush with exception
-            await delay(500 + (step.definitionId % 13) * 36);
+            await delay(160 + (step.definitionId % 13) * 3.6);
           }
         }
         state.publishLog();
@@ -513,23 +541,22 @@ function getErrorDetails(error: unknown) {
   }
 }
 
-function isAssertion(error: unknown, condition: string) {
-  return (
-    error &&
-    typeof error === "object" &&
-    AssertionTag in error &&
-    error[AssertionTag] === condition
-  );
+function isInterrupt(error: unknown) {
+  return error && typeof error === "object" && Cause in error;
 }
 
-const AssertionTag = Symbol("AssertionTag");
+const Cause = Symbol("Cause");
 
-export class Abort extends Error {
-  [AssertionTag]: string;
-  constructor(condition: string, value: unknown, info?: string) {
-    super(`${condition}=${value}${info != null ? ` (${info})` : ""}`);
-    this.name = "Abort";
-    this[AssertionTag] = condition;
+export class Interrupt extends Error {
+  [Cause]: string;
+  constructor(condition: string, value?: unknown, info?: string) {
+    super(
+      arguments.length === 1
+        ? condition
+        : `${condition}=${value}${info != null ? ` (${info})` : ""}`
+    );
+    this.name = "Interrupt";
+    this[Cause] = condition;
   }
 }
 
